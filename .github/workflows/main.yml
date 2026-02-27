@@ -1,0 +1,22 @@
+name: Auto Sync Upstream
+on:
+  schedule:
+    - cron: '0 0 * * *' # 每天北京时间早上 8 点自动执行
+  workflow_dispatch:   # 允许你随时手动点击运行
+
+jobs:
+  sync_latest_from_upstream:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v3
+        with:
+          ref: main # 如果你的默认分支是 master，请改为 master
+
+      - name: Sync Upstream
+        uses: a2021lv/github-repo-sync-upstream@v1.0.1
+        with:
+          upstream_repository: Penty-d/qq-farm-bot-ui
+          upstream_branch: main
+          target_branch: main # 你的分支名
+          github_token: ${{ secrets.GITHUB_TOKEN }}
