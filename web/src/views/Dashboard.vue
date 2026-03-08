@@ -2,16 +2,19 @@
 import { useIntervalFn } from '@vueuse/core'
 import { storeToRefs } from 'pinia'
 import { computed, nextTick, onMounted, reactive, ref, watch } from 'vue'
+import ConfirmModal from '@/components/ConfirmModal.vue'
 import BaseButton from '@/components/ui/BaseButton.vue'
 import BaseInput from '@/components/ui/BaseInput.vue'
 import BaseSelect from '@/components/ui/BaseSelect.vue'
 import { useAccountStore } from '@/stores/account'
 import { useBagStore } from '@/stores/bag'
 import { useStatusStore } from '@/stores/status'
+import { useToastStore } from '@/stores/toast'
 
 const statusStore = useStatusStore()
 const accountStore = useAccountStore()
 const bagStore = useBagStore()
+const toastStore = useToastStore()
 const {
   status,
   logs: statusLogs,
@@ -23,6 +26,9 @@ const { dashboardItems } = storeToRefs(bagStore)
 const logContainer = ref<HTMLElement | null>(null)
 const autoScroll = ref(true)
 const lastBagFetchAt = ref(0)
+const clearLogsLoading = ref(false)
+const clearLogsConfirmVisible = ref(false)
+const clearLogsConfirmLoading = ref(false)
 
 const allLogs = computed(() => {
   const sLogs = statusLogs.value || []
@@ -83,6 +89,7 @@ const events = [
   { label: '土地解锁', value: 'unlock_land' },
   { label: '好友巡查', value: 'friend_cycle' },
   { label: '访问好友', value: 'visit_friend' },
+  { label: '加黑名单', value: '加黑名单' },
 ]
 
 const eventLabelMap: Record<string, string> = Object.fromEntries(
@@ -100,20 +107,39 @@ const logs = [
 ]
 
 const displayName = computed(() => {
+  const account = accountStore.currentAccount
+
   // Try to use nickname from status (game server)
   const gameName = status.value?.status?.name
-  if (gameName)
+  if (gameName) {
+    // 如果有备注，显示为“昵称（备注）”
+    if (account?.name) {
+      return `${gameName} (${account.name})`
+    }
     return gameName
+  }
 
   // Check login status
   if (!status.value?.connection?.connected) {
-    const account = accountStore.currentAccount
-    return account?.name || account?.nick || '未登录'
+    if (account) {
+      // 如果有备注和昵称，显示为“昵称（备注）”
+      if (account.name && account.nick) {
+        return `${account.nick} (${account.name})`
+      }
+      return account.name || account.nick || '未登录'
+    }
+    return '未登录'
   }
 
   // Fallback to account name (usually ID) or '未命名'
-  const account = accountStore.currentAccount
-  return account?.name || account?.nick || '未命名'
+  if (account) {
+    // 如果有备注和昵称，显示为“昵称（备注）”
+    if (account.name && account.nick) {
+      return `${account.nick} (${account.name})`
+    }
+    return account.name || account.nick || '未命名'
+  }
+  return '未命名'
 })
 
 // Exp Rate & Time to Level
@@ -165,32 +191,53 @@ function formatBucketTime(item: any) {
 }
 
 // Next Check Countdown
-const nextFarmCheck = ref('--')
-const nextFriendCheck = ref('--')
+const nextFarmCheck = ref('--:--:--')
+const nextFriendCheck = ref('--:--:--')
 const localUptime = ref(0)
 let localNextFarmRemainSec = 0
 let localNextFriendRemainSec = 0
+let localFarmInspecting = false
+let localFriendInspecting = false
+let localFarmWaiting = false
+let localFriendWaiting = false
 
 function updateCountdowns() {
   // Update uptime
-  if (status.value?.connection?.connected) {
+  if (!status.value?.connection?.connected) {
+    nextFarmCheck.value = '账号未登录'
+    nextFriendCheck.value = '账号未登录'
+  }
+  else {
     localUptime.value++
-  }
 
-  if (localNextFarmRemainSec > 0) {
-    localNextFarmRemainSec--
-    nextFarmCheck.value = formatDuration(localNextFarmRemainSec)
-  }
-  else {
-    nextFarmCheck.value = '巡查中...'
-  }
+    // 优先显示巡查状态
+    if (localFarmInspecting) {
+      nextFarmCheck.value = '巡查中...'
+    }
+    else if (localFarmWaiting) {
+      nextFarmCheck.value = '等待巡查...'
+    }
+    else if (localNextFarmRemainSec > 0) {
+      localNextFarmRemainSec--
+      nextFarmCheck.value = formatDuration(localNextFarmRemainSec)
+    }
+    else {
+      nextFarmCheck.value = '等待巡查...'
+    }
 
-  if (localNextFriendRemainSec > 0) {
-    localNextFriendRemainSec--
-    nextFriendCheck.value = formatDuration(localNextFriendRemainSec)
-  }
-  else {
-    nextFriendCheck.value = '巡查中...'
+    if (localFriendInspecting) {
+      nextFriendCheck.value = '巡查中...'
+    }
+    else if (localFriendWaiting) {
+      nextFriendCheck.value = '等待巡查...'
+    }
+    else if (localNextFriendRemainSec > 0) {
+      localNextFriendRemainSec--
+      nextFriendCheck.value = formatDuration(localNextFriendRemainSec)
+    }
+    else {
+      nextFriendCheck.value = '等待巡查...'
+    }
   }
 }
 
@@ -201,6 +248,10 @@ watch(status, (newVal) => {
     // Here we just take server value when it comes.
     localNextFarmRemainSec = newVal.nextChecks.farmRemainSec || 0
     localNextFriendRemainSec = newVal.nextChecks.friendRemainSec || 0
+    localFarmInspecting = newVal.nextChecks.farmInspecting || false
+    localFriendInspecting = newVal.nextChecks.friendInspecting || false
+    localFarmWaiting = newVal.nextChecks.farmWaiting || false
+    localFriendWaiting = newVal.nextChecks.friendWaiting || false
     updateCountdowns() // Update immediately
   }
   if (newVal?.uptime !== undefined) {
@@ -297,7 +348,7 @@ async function refreshBag(force = false) {
   await bagStore.fetchBag(currentAccountId.value)
 }
 
-async function refresh() {
+async function refresh(forceReloadLogs = false) {
   if (currentAccountId.value) {
     const acc = currentAccount.value
     if (!acc)
@@ -309,7 +360,7 @@ async function refresh() {
       await statusStore.fetchAccountLogs()
     }
 
-    if (hasActiveLogFilter.value || !realtimeConnected.value) {
+    if (forceReloadLogs || hasActiveLogFilter.value || !realtimeConnected.value) {
       await statusStore.fetchLogs(currentAccountId.value, {
         module: filter.module || undefined,
         event: filter.event || undefined,
@@ -320,6 +371,40 @@ async function refresh() {
 
     // 仅在账号已运行且连接就绪后拉背包，避免启动阶段触发500
     await refreshBag()
+  }
+}
+
+function onLogFilterChange() {
+  refresh(true)
+}
+
+function onLogSearchTrigger() {
+  refresh(true)
+}
+
+async function onClearLogs() {
+  if (!currentAccountId.value || clearLogsLoading.value)
+    return
+  clearLogsConfirmVisible.value = true
+}
+
+async function executeClearLogs() {
+  if (!currentAccountId.value || clearLogsLoading.value)
+    return
+  try {
+    clearLogsConfirmLoading.value = true
+    clearLogsLoading.value = true
+    const ret = await statusStore.clearLogs(currentAccountId.value)
+    toastStore.success(`已清空 ${Number(ret?.cleared) || 0} 条运行日志`)
+    clearLogsConfirmVisible.value = false
+    await refresh(true)
+  }
+  catch (e: any) {
+    toastStore.error(e?.message || '清空运行日志失败')
+  }
+  finally {
+    clearLogsConfirmLoading.value = false
+    clearLogsLoading.value = false
   }
 }
 
@@ -340,7 +425,7 @@ watch(() => JSON.stringify(status.value?.operations || {}), (next, prev) => {
 
 watch(hasActiveLogFilter, (enabled) => {
   statusStore.setRealtimeLogsEnabled(!enabled)
-  refresh()
+  refresh(enabled)
 })
 
 function onLogScroll(e: Event) {
@@ -533,21 +618,21 @@ useIntervalFn(updateCountdowns, 1000)
                 v-model="filter.module"
                 :options="modules"
                 class="w-32"
-                @change="refresh"
+                @change="onLogFilterChange"
               />
 
               <BaseSelect
                 v-model="filter.event"
                 :options="events"
                 class="w-32"
-                @change="refresh"
+                @change="onLogFilterChange"
               />
 
               <BaseSelect
                 v-model="filter.isWarn"
                 :options="logs"
                 class="w-32"
-                @change="refresh"
+                @change="onLogFilterChange"
               />
 
               <BaseInput
@@ -555,21 +640,31 @@ useIntervalFn(updateCountdowns, 1000)
                 placeholder="关键词..."
                 class="w-32"
                 clearable
-                @keyup.enter="refresh"
-                @clear="refresh"
+                @keyup.enter="onLogSearchTrigger"
+                @clear="onLogSearchTrigger"
               />
 
               <BaseButton
                 variant="primary"
                 size="sm"
-                @click="refresh"
+                @click="onLogSearchTrigger"
               >
                 <div class="i-carbon-search" />
+              </BaseButton>
+
+              <BaseButton
+                variant="danger"
+                size="sm"
+                :loading="clearLogsLoading"
+                @click="onClearLogs"
+              >
+                <div class="i-carbon-trash-can mr-1" />
+                清空日志
               </BaseButton>
             </div>
           </div>
 
-          <div ref="logContainer" class="max-h-[50vh] min-h-0 flex-1 overflow-y-auto rounded bg-gray-50 p-4 text-sm leading-relaxed font-mono md:max-h-none dark:bg-gray-900" @scroll="onLogScroll">
+          <div ref="logContainer" class="max-h-[50vh] min-h-0 flex-1 overflow-y-auto rounded bg-gray-50 p-4 text-sm leading-relaxed md:max-h-none dark:bg-gray-900" @scroll="onLogScroll">
             <div v-if="!allLogs.length" class="py-8 text-center text-gray-400">
               暂无日志
             </div>
@@ -597,7 +692,7 @@ useIntervalFn(updateCountdowns, 1000)
                 <div class="i-carbon-sprout text-lg text-green-500" />
                 <span>农场</span>
               </div>
-              <div class="text-lg font-bold font-mono">
+              <div class="text-lg font-bold">
                 {{ nextFarmCheck }}
               </div>
             </div>
@@ -606,7 +701,7 @@ useIntervalFn(updateCountdowns, 1000)
                 <div class="i-carbon-user-multiple text-lg text-blue-500" />
                 <span>好友</span>
               </div>
-              <div class="text-lg font-bold font-mono">
+              <div class="text-lg font-bold">
                 {{ nextFriendCheck }}
               </div>
             </div>
@@ -619,11 +714,22 @@ useIntervalFn(updateCountdowns, 1000)
             <div class="i-carbon-chart-column" />
             <span>今日统计</span>
           </h3>
-          <div class="grid grid-cols-2 gap-2 2xl:gap-3">
+          <div v-if="!status?.connection?.connected" class="flex flex-col items-center justify-center gap-4 rounded-lg bg-white p-12 text-center text-gray-500 shadow dark:bg-gray-800">
+            <div class="i-carbon-connection-signal-off text-4xl text-gray-400" />
+            <div class="flex flex-col">
+              <div class="text-lg text-gray-700 font-medium dark:text-gray-300">
+                账号未登录
+              </div>
+              <div class="mt-1 text-sm text-gray-400">
+                请先运行账号或检查网络连接
+              </div>
+            </div>
+          </div>
+          <div v-else class="grid grid-cols-2 gap-2 2xl:gap-3">
             <div
               v-for="(val, key) in (status?.operations || {})"
               :key="key"
-              class="flex items-center justify-between rounded-lg bg-gray-50 px-3 py-2 dark:bg-gray-700/30 2xl:px-4 2xl:py-3"
+              class="flex items-center justify-between rounded bg-gray-50 px-3 py-2 dark:bg-gray-700/30"
             >
               <div class="flex items-center gap-2">
                 <div class="text-base 2xl:text-lg" :class="[getOpIcon(key), getOpColor(key)]" />
@@ -639,5 +745,14 @@ useIntervalFn(updateCountdowns, 1000)
         </div>
       </div>
     </div>
+
+    <ConfirmModal
+      :show="clearLogsConfirmVisible"
+      :loading="clearLogsConfirmLoading"
+      title="确认清空日志"
+      message="确定清空当前账号的运行日志吗？此操作不可恢复。"
+      @confirm="executeClearLogs"
+      @cancel="!clearLogsConfirmLoading && (clearLogsConfirmVisible = false)"
+    />
   </div>
 </template>

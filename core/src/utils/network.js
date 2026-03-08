@@ -12,6 +12,7 @@ const { updateStatusFromLogin, updateStatusGold, updateStatusLevel } = require('
 const { recordOperation } = require('../services/stats');
 const { types } = require('./proto');
 const { toLong, toNum, syncServerTime, log, logWarn } = require('./utils');
+const cryptoWasm = require('./crypto-wasm');
 
 // ============ 事件发射器 (用于推送通知) ============
 const networkEvents = new EventEmitter();
@@ -47,7 +48,15 @@ function hasOwn(obj, key) {
 }
 
 // ============ 消息编解码 ============
-function encodeMsg(serviceName, methodName, bodyBytes) {
+async function encodeMsg(serviceName, methodName, bodyBytes) {
+    let finalBody = bodyBytes || Buffer.alloc(0);
+    try {
+        finalBody = await cryptoWasm.encryptBuffer(finalBody);
+    } catch (e) {
+        // 兼容模式：如果加密失败（例如环境不支持），尝试发送未加密包，但打印警告
+        logWarn('系统', `WASM加密失败: ${e.message}`);
+    }
+
     const msg = types.GateMessage.create({
         meta: {
             service_name: serviceName,
@@ -56,21 +65,39 @@ function encodeMsg(serviceName, methodName, bodyBytes) {
             client_seq: toLong(clientSeq),
             server_seq: toLong(serverSeq),
         },
-        body: bodyBytes || Buffer.alloc(0),
+        body: finalBody,
     });
     const encoded = types.GateMessage.encode(msg).finish();
     clientSeq++;
     return encoded;
 }
 
-function sendMsg(serviceName, methodName, bodyBytes, callback) {
+async function sendMsg(serviceName, methodName, bodyBytes, callback) {
     if (!ws || ws.readyState !== WebSocket.OPEN) {
         log('系统', '[WS] 连接未打开');
+        if (callback) callback(new Error('连接未打开'));
         return false;
     }
     const seq = clientSeq;
-    const encoded = encodeMsg(serviceName, methodName, bodyBytes);
+    let encoded;
+    try {
+        encoded = await encodeMsg(serviceName, methodName, bodyBytes);
+    } catch (err) {
+        if (callback) callback(err);
+        return false;
+    }
+
     if (callback) pendingCallbacks.set(seq, callback);
+
+    // 再次检查连接状态（因为 await 期间可能断开）
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        if (callback) {
+            pendingCallbacks.delete(seq);
+            callback(new Error('连接已在加密途中关闭'));
+        }
+        return false;
+    }
+    
     ws.send(encoded);
     return true;
 }
@@ -83,7 +110,7 @@ function sendMsgAsync(serviceName, methodName, bodyBytes, timeout = 10000) {
             reject(new Error(`连接未打开: ${methodName}`));
             return;
         }
-        
+
         const seq = clientSeq;
         const timeoutKey = `request_timeout_${seq}`;
         networkScheduler.setTimeoutTask(timeoutKey, timeout, () => {
@@ -93,16 +120,21 @@ function sendMsgAsync(serviceName, methodName, bodyBytes, timeout = 10000) {
             reject(new Error(`请求超时: ${methodName} (seq=${seq}, pending=${pending})`));
         });
 
-        const sent = sendMsg(serviceName, methodName, bodyBytes, (err, body, meta) => {
+        sendMsg(serviceName, methodName, bodyBytes, (err, body, meta) => {
             networkScheduler.clear(timeoutKey);
             if (err) reject(err);
             else resolve({ body, meta });
-        });
-        
-        if (!sent) {
+        }).then(sent => {
+            if (!sent) {
+                networkScheduler.clear(timeoutKey);
+                // 这里不再 reject，因为 callback 会被调用并 reject
+                // 但如果 sendMsg 返回 false 且没有调用 callback (例如连接未打开)，则需要处理
+                // 修改后的 sendMsg 会在连接未打开时调用 callback
+            }
+        }).catch(err => {
             networkScheduler.clear(timeoutKey);
-            reject(new Error(`发送失败: ${methodName}`));
-        }
+            reject(err);
+        });
     });
 }
 
@@ -152,6 +184,133 @@ function handleMessage(data) {
     }
 }
 
+// ============ 通知处理映射表 ============
+const notifyHandlers = new Map();
+// 被踢下线
+notifyHandlers.set('Kickout', (eventBody) => {
+    const notify = types.KickoutNotify.decode(eventBody);
+    log('推送', `原因: ${notify.reason_message || '未知'}`);
+    networkEvents.emit('kickout', {
+        type: 'Kickout',
+        reason: notify.reason_message || '未知',
+    });
+});
+
+// 土地状态变化 (被放虫/放草/偷菜等)
+notifyHandlers.set('LandsNotify', (eventBody) => {
+    const notify = types.LandsNotify.decode(eventBody);
+    const hostGid = toNum(notify.host_gid);
+    const lands = notify.lands || [];
+    if (lands.length > 0 && (hostGid === userState.gid || hostGid === 0)) {
+        networkEvents.emit('landsChanged', lands);
+    }
+});
+
+// 物品变化通知 (经验/金币等)
+notifyHandlers.set('ItemNotify', (eventBody) => {
+    const notify = types.ItemNotify.decode(eventBody);
+    const items = notify.items || [];
+    for (const itemChg of items) {
+        const item = itemChg.item;
+        if (!item) continue;
+        const id = toNum(item.id);
+        const count = toNum(item.count);
+        const delta = toNum(itemChg.delta);
+
+        // 仅使用 ID=1101 作为经验值标准
+        if (id === 1101) {
+            // 优先使用总量；若仅有 delta 也可累加
+            if (count > 0) userState.exp = count;
+            else if (delta !== 0) userState.exp = Math.max(0, Number(userState.exp || 0) + delta);
+            // 这里调用 updateStatusLevel 会触发 status.js -> worker.js -> stats.js 的更新流程
+            updateStatusLevel(userState.level, userState.exp);
+        } else if (id === 1 || id === 1001) {
+            // 金币通知有时只有 delta 没有总量，避免把未提供总量误当 0 覆盖
+            if (count > 0) {
+                userState.gold = count;
+            } else if (delta !== 0) {
+                userState.gold = Math.max(0, Number(userState.gold || 0) + delta);
+            }
+            updateStatusGold(userState.gold);
+        } else if (id === 1002) {
+            // 点券
+            if (count > 0) {
+                userState.coupon = count;
+            } else if (delta !== 0) {
+                userState.coupon = Math.max(0, Number(userState.coupon || 0) + delta);
+            }
+        }
+    }
+});
+
+// 基本信息变化 (升级等)
+notifyHandlers.set('BasicNotify', (eventBody) => {
+    const notify = types.BasicNotify.decode(eventBody);
+    if (!notify.basic) return;
+    const oldLevel = userState.level;
+    if (hasOwn(notify.basic, 'level')) {
+        const nextLevel = toNum(notify.basic.level);
+        if (Number.isFinite(nextLevel) && nextLevel > 0) userState.level = nextLevel;
+    }
+    let shouldUpdateGoldView = false;
+    if (hasOwn(notify.basic, 'gold')) {
+        const nextGold = toNum(notify.basic.gold);
+        if (Number.isFinite(nextGold) && nextGold >= 0) {
+            userState.gold = nextGold;
+            shouldUpdateGoldView = true;
+        }
+    }
+    if (hasOwn(notify.basic, 'exp')) {
+        const exp = toNum(notify.basic.exp);
+        if (Number.isFinite(exp) && exp >= 0) {
+            userState.exp = exp;
+            updateStatusLevel(userState.level, exp);
+        }
+    }
+    if (shouldUpdateGoldView) {
+        updateStatusGold(userState.gold);
+    }
+    if (userState.level !== oldLevel) {
+        recordOperation('levelUp', 1);
+    }
+});
+
+// 好友申请通知 (微信同玩)
+notifyHandlers.set('FriendApplicationReceivedNotify', (eventBody) => {
+    const notify = types.FriendApplicationReceivedNotify.decode(eventBody);
+    const applications = notify.applications || [];
+    if (applications.length > 0) {
+        networkEvents.emit('friendApplicationReceived', applications);
+    }
+});
+
+// 好友添加成功通知
+notifyHandlers.set('FriendAddedNotify', (eventBody) => {
+    const notify = types.FriendAddedNotify.decode(eventBody);
+    const friends = notify.friends || [];
+    if (friends.length > 0) {
+        const names = friends.map(f => f.name || f.remark || `GID:${toNum(f.gid)}`).join(', ');
+        log('好友', `新好友: ${names}`);
+    }
+});
+
+// 商品解锁通知 (升级后解锁新种子等)
+notifyHandlers.set('GoodsUnlockNotify', (eventBody) => {
+    const notify = types.GoodsUnlockNotify.decode(eventBody);
+    const goods = notify.goods_list || [];
+    if (goods.length > 0) {
+        networkEvents.emit('goodsUnlockNotify', goods);
+    }
+});
+
+// 任务状态变化通知
+notifyHandlers.set('TaskInfoNotify', (eventBody) => {
+    const notify = types.TaskInfoNotify.decode(eventBody);
+    if (notify.task_info) {
+        networkEvents.emit('taskInfoNotify', notify.task_info);
+    }
+});
+
 function handleNotify(msg) {
     if (!msg.body || msg.body.length === 0) return;
     try {
@@ -159,160 +318,12 @@ function handleNotify(msg) {
         const type = event.message_type || '';
         const eventBody = event.body;
 
-        // 被踢下线
-        if (type.includes('Kickout')) {
-            log('推送', `被踢下线! ${type}`);
-            try {
-                const notify = types.KickoutNotify.decode(eventBody);
-                log('推送', `原因: ${notify.reason_message || '未知'}`);
-                networkEvents.emit('kickout', {
-                    type,
-                    reason: notify.reason_message || '未知',
-                });
-            } catch { }
-            return;
+        for (const [key, handler] of notifyHandlers) {
+            if (type.includes(key)) {
+                try { handler(eventBody); } catch { }
+                return;
+            }
         }
-
-        // 土地状态变化 (被放虫/放草/偷菜等)
-        if (type.includes('LandsNotify')) {
-            try {
-                const notify = types.LandsNotify.decode(eventBody);
-                const hostGid = toNum(notify.host_gid);
-                const lands = notify.lands || [];
-                if (lands.length > 0) {
-                    // 如果是自己的农场，触发事件
-                    if (hostGid === userState.gid || hostGid === 0) {
-                        networkEvents.emit('landsChanged', lands);
-                    }
-                }
-            } catch { }
-            return;
-        }
-
-        // 物品变化通知 (经验/金币等)
-        if (type.includes('ItemNotify')) {
-            try {
-                const notify = types.ItemNotify.decode(eventBody);
-                const items = notify.items || [];
-                for (const itemChg of items) {
-                    const item = itemChg.item;
-                    if (!item) continue;
-                    const id = toNum(item.id);
-                    const count = toNum(item.count);
-                    const delta = toNum(itemChg.delta);
-                    
-                    // 仅使用 ID=1101 作为经验值标准
-                    if (id === 1101) {
-                        // 优先使用总量；若仅有 delta 也可累加
-                        if (count > 0) userState.exp = count;
-                        else if (delta !== 0) userState.exp = Math.max(0, Number(userState.exp || 0) + delta);
-                        // 这里调用 updateStatusLevel 会触发 status.js -> worker.js -> stats.js 的更新流程
-                        updateStatusLevel(userState.level, userState.exp);
-                    } else if (id === 1 || id === 1001) {
-                        // 金币通知有时只有 delta 没有总量，避免把未提供总量误当 0 覆盖
-                        if (count > 0) {
-                            userState.gold = count;
-                        } else if (delta !== 0) {
-                            userState.gold = Math.max(0, Number(userState.gold || 0) + delta);
-                        }
-                        updateStatusGold(userState.gold);
-                    } else if (id === 1002) {
-                        // 点券
-                        if (count > 0) {
-                            userState.coupon = count;
-                        } else if (delta !== 0) {
-                            userState.coupon = Math.max(0, Number(userState.coupon || 0) + delta);
-                        }
-                    }
-                }
-            } catch { }
-            return;
-        }
-
-        // 基本信息变化 (升级等)
-        if (type.includes('BasicNotify')) {
-            try {
-                const notify = types.BasicNotify.decode(eventBody);
-                if (notify.basic) {
-                    const oldLevel = userState.level;
-                    if (hasOwn(notify.basic, 'level')) {
-                        const nextLevel = toNum(notify.basic.level);
-                        if (Number.isFinite(nextLevel) && nextLevel > 0) userState.level = nextLevel;
-                    }
-                    let shouldUpdateGoldView = false;
-                    if (hasOwn(notify.basic, 'gold')) {
-                        const nextGold = toNum(notify.basic.gold);
-                        if (Number.isFinite(nextGold) && nextGold >= 0) {
-                            userState.gold = nextGold;
-                            shouldUpdateGoldView = true;
-                        }
-                    }
-                    if (hasOwn(notify.basic, 'exp')) {
-                        const exp = toNum(notify.basic.exp);
-                        if (Number.isFinite(exp) && exp >= 0) {
-                            userState.exp = exp;
-                            updateStatusLevel(userState.level, exp);
-                        }
-                    }
-                    if (shouldUpdateGoldView) {
-                        updateStatusGold(userState.gold);
-                    }
-                    if (userState.level !== oldLevel) {
-                        recordOperation('levelUp', 1);
-                    }
-                }
-            } catch { }
-            return;
-        }
-
-        // 好友申请通知 (微信同玩)
-        if (type.includes('FriendApplicationReceivedNotify')) {
-            try {
-                const notify = types.FriendApplicationReceivedNotify.decode(eventBody);
-                const applications = notify.applications || [];
-                if (applications.length > 0) {
-                    networkEvents.emit('friendApplicationReceived', applications);
-                }
-            } catch { }
-            return;
-        }
-
-        // 好友添加成功通知
-        if (type.includes('FriendAddedNotify')) {
-            try {
-                const notify = types.FriendAddedNotify.decode(eventBody);
-                const friends = notify.friends || [];
-                if (friends.length > 0) {
-                    const names = friends.map(f => f.name || f.remark || `GID:${toNum(f.gid)}`).join(', ');
-                    log('好友', `新好友: ${names}`);
-                }
-            } catch { }
-            return;
-        }
-
-        // 商品解锁通知 (升级后解锁新种子等)
-        if (type.includes('GoodsUnlockNotify')) {
-            try {
-                const notify = types.GoodsUnlockNotify.decode(eventBody);
-                const goods = notify.goods_list || [];
-                if (goods.length > 0) {
-                    networkEvents.emit('goodsUnlockNotify', goods);
-                }
-            } catch { }
-            return;
-        }
-
-        // 任务状态变化通知
-        if (type.includes('TaskInfoNotify')) {
-            try {
-                const notify = types.TaskInfoNotify.decode(eventBody);
-                if (notify.task_info) {
-                    networkEvents.emit('taskInfoNotify', notify.task_info);
-                }
-            } catch { }
-            
-        }
-
         // 其他未处理的推送类型 (调试用)
         // log('推送', `未处理类型: ${type}`);
     } catch (e) {
@@ -400,25 +411,25 @@ function startHeartbeat() {
     networkScheduler.clear('heartbeat_interval');
     lastHeartbeatResponse = Date.now();
     heartbeatMissCount = 0;
-    
+
     networkScheduler.setIntervalTask('heartbeat_interval', CONFIG.heartbeatInterval, () => {
         if (!userState.gid) return;
-        
+
         // 检查上次心跳响应时间，超过 60 秒没响应说明连接有问题
         const timeSinceLastResponse = Date.now() - lastHeartbeatResponse;
         if (timeSinceLastResponse > 60000) {
             heartbeatMissCount++;
-            logWarn('心跳', `连接可能已断开 (${Math.round(timeSinceLastResponse/1000)}s 无响应, pending=${pendingCallbacks.size})`);
+            logWarn('心跳', `连接可能已断开 (${Math.round(timeSinceLastResponse / 1000)}s 无响应, pending=${pendingCallbacks.size})`);
             if (heartbeatMissCount >= 2) {
                 log('心跳', '尝试重连...');
                 // 清理待处理的回调，避免堆积
                 pendingCallbacks.forEach((cb, _seq) => {
-                    try { cb(new Error('连接超时，已清理')); } catch {}
+                    try { cb(new Error('连接超时，已清理')); } catch { }
                 });
                 pendingCallbacks.clear();
             }
         }
-        
+
         const body = types.HeartbeatRequest.encode(types.HeartbeatRequest.create({
             gid: toLong(userState.gid),
             client_version: CONFIG.clientVersion,
